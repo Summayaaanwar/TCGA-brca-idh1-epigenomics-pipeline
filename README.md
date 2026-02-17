@@ -1,10 +1,10 @@
-# TCGA-BRCA IDH1 Epigenomics Pipeline (Matched Tumor–Normal)
+# TCGA-BRCA IDH1 Epigenomics Pipeline (Matched Tumor-Normal)
 
 This repository contains an R pipeline to analyze **TCGA-BRCA matched tumor–normal samples** by integrating:
 - **RNA-seq expression** (IDH1 stratification)
 - **Illumina 450K DNA methylation** (QC + DMPs + DMRs)
 - **Promoter enrichment (mCSEA)**
-- **Circos/chord plots and gene–CpG network visualization**
+- **Circos/chord plots and gene-CpG network visualization**
 ---
 
 ## What the script does (overview)
