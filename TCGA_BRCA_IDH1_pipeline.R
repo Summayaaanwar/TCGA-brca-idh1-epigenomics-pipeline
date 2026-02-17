@@ -1,3 +1,255 @@
+#TCGA IDH1 Meth Analysis
+
+setwd("~/Desktop/R/TCGA") 
+
+# Install required packages
+if (!requireNamespace("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+
+BiocManager::install(c("TCGAbiolinks", "SummarizedExperiment", "limma", "minfi", 
+                       "dplyr", "ggplot2", "ComplexHeatmap"))
+
+# Load libraries
+library(TCGAbiolinks)
+library(SummarizedExperiment)
+library(limma)
+library(minfi)
+library(dplyr)
+library(ggplot2)
+library(ComplexHeatmap)
+library(tidyverse)
+library(ggpubr)
+
+#### creating barcode for downloading paired data#########
+
+# Query metadata for all methylation samples (no download yet)
+query_all <- GDCquery(
+  project = "TCGA-BRCA",
+  data.category = "DNA Methylation",
+  platform = "Illumina Human Methylation 450",
+  data.type = "Methylation Beta Value"
+)
+
+# Extract metadata
+metadata <- getResults(query_all)
+
+# Extract the first 3 fields of barcode for patient-level ID
+metadata$patient_id <- substr(metadata$cases, 1, 12)
+
+# Split by sample type
+tumor_samples  <- metadata[metadata$sample_type == "Primary Tumor", ]
+normal_samples <- metadata[metadata$sample_type == "Solid Tissue Normal", ]
+
+# Find patient IDs with both tumor and normal samples
+common_patients <- intersect(tumor_samples$patient_id, normal_samples$patient_id)
+
+# Subset to 50 matched patients (or fewer if not enough)
+matched_patients <- head(common_patients, 60)
+
+# Get corresponding barcodes
+tumor_barcodes  <- tumor_samples$cases[tumor_samples$patient_id %in% matched_patients]
+normal_barcodes <- normal_samples$cases[normal_samples$patient_id %in% matched_patients]
+
+# Combine tumor and normal barcodes
+selected_barcodes <- c(tumor_barcodes, normal_barcodes)
+# Check how many times each patient appears
+table(substr(selected_barcodes, 1, 12))
+
+# Function to select one tumor and one normal per patient
+select_one_pair <- function(tumor_df, normal_df, patient_ids) {
+  selected_tumors  <- do.call(rbind, lapply(patient_ids, function(pid) tumor_df[tumor_df$patient_id == pid, ][1, ]))
+  selected_normals <- do.call(rbind, lapply(patient_ids, function(pid) normal_df[normal_df$patient_id == pid, ][1, ]))
+  rbind(selected_tumors, selected_normals)
+}
+
+# Apply to your matched patients
+final_df <- select_one_pair(tumor_samples, normal_samples, matched_patients)
+
+# Final selected barcodes
+selected_barcodes <- final_df$cases
+length(selected_barcodes)  # Should be exactly 120
+
+write.table(selected_barcodes, 
+            file = "selected_TCGA_barcodes.txt", 
+            quote = FALSE, 
+            row.names = FALSE, 
+            col.names = FALSE)
+rm(final_df,metadata,normal_samples,tumor_samples,query_all)
+
+#### GDC query with selected barcodes### perform it after verifying data for transcriptome.
+query_meth <- GDCquery(
+  project = "TCGA-BRCA",
+  data.category = "DNA Methylation",
+  data.type = "Methylation Beta Value",
+  platform = "Illumina Human Methylation 450",
+  barcode = selected_barcodes
+)
+
+GDCdownload(query_meth, files.per.chunk = 10, directory ="~/Desktop/R/TCGA/meth/")
+brca_met <- GDCprepare(query_meth, summarizedExperiment = TRUE, directory = "~/Desktop/R/TCGA/meth/")
+save(brca_met, file = "~/Desktop/R/TCGA/meth_BRCA_matched_120.RData")
+
+table(colData(brca_met)$sample_type)
+
+beta <- assay(brca_met)
+write.csv(as.data.frame(beta), "meth-TCGA.csv")
+
+metadata <- colData(brca_met)
+metadata_df <- as.data.frame(metadata)
+
+# Convert list columns to character
+metadata_df[] <- lapply(metadata_df, function(col) {
+  if (is.list(col)) {
+    sapply(col, function(x) paste(as.character(x), collapse = "; "))
+  } else {
+    col
+  }
+})
+
+# Write to CSV
+write.csv(metadata_df, "rowData-meth.csv", row.names = FALSE)
+
+
+row_anno <- rowData(brca_met)
+write.csv(as.data.frame(row_anno), "meth-probe_annotations.csv")
+
+
+##### .... verifying if the barcode samples also have transcriptome data...##3
+
+# Check expression availability
+# Get just the first 15 characters for each barcode
+short_barcodes <- substr(selected_barcodes, 1, 15)
+
+# Remove duplicates
+short_barcodes <- unique(short_barcodes)
+
+# Try querying again
+query_expr_check <- GDCquery(
+  project = "TCGA-BRCA",
+  data.category = "Transcriptome Profiling",
+  data.type = "Gene Expression Quantification",
+  workflow.type = "STAR - Counts",
+  barcode = short_barcodes
+)
+
+# Check how many matched
+matched_barcodes <- unique(query_expr_check$results[[1]]$cases)
+length(matched_barcodes)
+
+query_expr <- GDCquery(
+  project = "TCGA-BRCA",
+  data.category = "Transcriptome Profiling",
+  data.type = "Gene Expression Quantification",
+  workflow.type = "STAR - Counts",
+  barcode = matched_barcodes
+)
+
+GDCdownload(query_expr, files.per.chunk = 10, directory ="~/Desktop/R/TCGA/expr/")
+expr_data <- GDCprepare(query_expr, summarizedExperiment = TRUE, directory = "~/Desktop/R/TCGA/expr/")
+save(expr_data, file = "~/Desktop/R/TCGA/Exp_BRCA_matched_120.RData")
+# Extract expression matrix
+expr_matrix <- assay(expr_data)
+
+# Check if gene IDs are Ensembl (e.g., "ENSG00000138413") or gene symbols
+# If Ensembl IDs, map them to symbols:
+library(org.Hs.eg.db)
+library(AnnotationDbi)
+
+gene_ids <- rownames(expr_matrix)
+
+# Remove version numbers
+gene_ids_clean <- gsub("\\..*", "", gene_ids)
+
+gene_symbols <- mapIds(
+  org.Hs.eg.db,
+  keys = gene_ids_clean,
+  column = "SYMBOL",
+  keytype = "ENSEMBL",
+  multiVals = "first"
+)
+
+# Attach gene symbols as rownames or metadata
+names(gene_symbols) <- rownames(expr_matrix)
+
+idh1_ensembl <- mapIds(org.Hs.eg.db, keys = "IDH1", column = "ENSEMBL", keytype = "SYMBOL", multiVals = "first")
+idh1_row <- which(gene_ids_clean == idh1_ensembl)
+idh1_expr <- expr_matrix[idh1_row, ]
+idh1_expr <- as.numeric(idh1_expr)
+names(idh1_expr) <- colnames(expr_matrix)
+
+#====.......Tumor data only.....####
+tumor_samples <- colData(expr_data)$sample_type == "Primary Tumor"
+expr_matrix_tumor <- expr_matrix[, tumor_samples]
+
+#...identify IDH1 row for tumor only......###
+
+idh1_ensembl <- mapIds(org.Hs.eg.db, keys = "IDH1", 
+                       column = "ENSEMBL", keytype = "SYMBOL", multiVals = "first")
+idh1_index <- which(gene_ids_clean == idh1_ensembl)
+# Extract IDH1 expression in tumors
+tumor_idh1_expr_values <- expr_matrix_tumor[idh1_index, ]
+# strtify be median value
+median_idh1 <- median(tumor_idh1_expr_values, na.rm = TRUE)
+idh1_status <- ifelse(tumor_idh1_expr_values >= median_idh1, "High", "Low")
+
+tumor_coldata <- colData(expr_data)[tumor_samples, ]
+tumor_coldata$IDH1_group <- idh1_status
+dim(tumor_coldata)
+
+### phenotype information for tumor samples
+# Get tumor-only sample barcodes
+tumor_barcodes <- colnames(expr_matrix)[tumor_samples]
+
+# Extract IDH1 groups
+idh1_status <- ifelse(expr_matrix[idh1_index, tumor_samples] >= median_idh1, "High", "Low")
+
+# Make phenotype dataframe
+pheno_df <- data.frame(
+  Sample = tumor_barcodes,
+  IDH1_group = idh1_status
+)
+rownames(pheno_df) <- pheno_df$Sample
+
+
+
+
+
+# Download and prepare the data
+GDCdownload(query_met, files.per.chunk = 10, directory = "~/Desktop/R/TCGA/meth/")
+
+brca_met <- GDCprepare(query_met, summarizedExperiment = TRUE, directory = "~/Desktop/R/TCGA/meth/")
+
+# save summarized experiment object
+save(brca_met, file = "~/Desktop/R/TCGA/meth_BRCA_SummarizedExperiment.RData")
+rm(brca_met)
+# load summarized experiment object 
+load("meth_BRCA_SummarizedExperiment.RData")
+brca_met
+# Extract beta values
+beta <- assay(brca_met)
+
+# Get sample metadata
+metadata <- colData(brca_met)
+
+a <- as.data.frame(assay(brca_met))
+write.csv(a, "meth-TCGA.csv")
+b <- rowData(brca_met)
+write.csv(b, "rowData-meth-TCGA.csv")
+
+# Step 2: Query mutation data for IDH1
+query_mut <- GDCquery(
+  project = "TCGA-BRCA",
+  data.category = "Simple Nucleotide Variation",
+  data.type = "Masked Somatic Mutation",
+  workflow.type = "MuTect2"
+)
+
+mRNA_df <- read.csv("TCGA-transcriptome.csv", row.names = 1)
+rowData <- read.csv("rowData-TCGA-transcriptome.csv")
+
+GDCdownload(query_mut)
+maf <- GDCprepare(query_mut)
+
 setwd("~/Desktop/R/TCGA") 
 # Load required packages
 library(TCGAbiolinks)    # TCGA data access
@@ -143,15 +395,6 @@ q_low_n  <- quantile(b$idh1_normal, 0.15, na.rm = TRUE)
 
 b$IDH_mean <- ifelse(b$idh1_normal >= q_high_n, "High",
                      ifelse(b$idh1_normal <= q_low_n, "Low", "Medium"))
-
-# Extract TP53/PTEN expression
-#tp53_expr <- assay(expr_data)["ENSG00000141510", ]  # TP53
-#pten_expr <- assay(expr_data)["ENSG00000171862", ]  # PTEN
-
-# Correlate with IDH1
-#cor.test(idh1_expr, tp53_expr, method = "spearman")
-#cor.test(idh1_expr, pten_expr, method = "spearman")
-
 # Calculate ΔIDH1 (Tumor - Normal)
 delta_idh1 <- idh1_tumor - idh1_normal
 
